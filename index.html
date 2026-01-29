@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>NotepadAI</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <textarea
+        id="editor"
+        spellcheck="false"
+        aria-label="Notepad editor"
+      ></textarea>
+      <div id="status-bar" class="status-bar" aria-live="polite">
+        <span id="status-position">Ln 1, Col 1</span>
+        <span id="status-wrap">Word Wrap: On</span>
+      </div>
+    </div>
+
+    <div id="ai-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop" data-close="true"></div>
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <header>
+          <h2>AI Settings</h2>
+          <button id="ai-close" class="icon-button" aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <label>
+            API Endpoint
+            <input id="ai-endpoint" type="text" placeholder="https://example.com/rewrite" />
+          </label>
+          <label>
+            API Key
+            <input id="ai-key" type="password" placeholder="Paste your key" />
+            <span id="ai-key-status" class="hint">No key stored.</span>
+          </label>
+          <label>
+            Custom Prompt
+            <textarea id="ai-prompt" rows="5" placeholder="Make this clearer and more concise."></textarea>
+          </label>
+        </div>
+        <footer>
+          <button id="ai-clear" class="ghost">Clear Key</button>
+          <div class="spacer"></div>
+          <button id="ai-cancel" class="ghost">Cancel</button>
+          <button id="ai-save" class="primary">Save</button>
+        </footer>
+      </div>
+    </div>
+
+    <div id="busy-overlay" class="busy" aria-hidden="true">
+      <div class="busy-card">Rewriting…</div>
+    </div>
+  </body>
+</html>
