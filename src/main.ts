@@ -302,6 +302,18 @@ async function parseAiResponse(response: Response): Promise<string> {
   }
 }
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const maybeMessage = (error as { message?: unknown }).message;
+    if (typeof maybeMessage === "string") return maybeMessage;
+    const maybeError = (error as { error?: unknown }).error;
+    if (typeof maybeError === "string") return maybeError;
+  }
+  return "Unknown error.";
+}
+
 async function runAiRewrite() {
   const { endpoint, prompt } = await getAiSettings();
   const key = (await invoke<string | null>("get_api_key")) || "";
@@ -369,9 +381,11 @@ async function runAiRewrite() {
   setBusyState(true);
   try {
     const responseData = await invoke<AiHttpResponse>("ai_request", {
-      endpoint,
-      headers,
-      body,
+      request: {
+        endpoint,
+        headers,
+        body,
+      },
     });
     const response = new Response(responseData.body, {
       status: responseData.status,
@@ -400,8 +414,7 @@ async function runAiRewrite() {
     }
     setDirtyState(true);
   } catch (error) {
-    const messageText =
-      error instanceof Error ? error.message : "Unknown error.";
+    const messageText = getErrorMessage(error);
     await message(messageText, {
       title: "NotepadAI",
       kind: "error",
