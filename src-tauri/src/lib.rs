@@ -115,6 +115,8 @@ fn build_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
     let exit_item = MenuItem::with_id(app, "file_exit", "Exit", true, Some("Alt+F4"))?;
 
     let undo_item = MenuItem::with_id(app, "edit_undo", "Undo", true, None::<&str>)?;
+    let undo_ai_item =
+        MenuItem::with_id(app, "edit_undo_ai", "Undo AI", true, Some("Ctrl+Alt+Z"))?;
     let cut_item = MenuItem::with_id(app, "edit_cut", "Cut", true, None::<&str>)?;
     let copy_item = MenuItem::with_id(app, "edit_copy", "Copy", true, None::<&str>)?;
     let paste_item = MenuItem::with_id(app, "edit_paste", "Paste", true, None::<&str>)?;
@@ -129,7 +131,20 @@ fn build_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
     let about_item = MenuItem::with_id(app, "help_about", "About", true, None::<&str>)?;
 
     let ai_rewrite_item = MenuItem::with_id(app, "ai_rewrite", "Rewrite", true, Some("Ctrl+R"))?;
+    let ai_improve_item = MenuItem::with_id(app, "ai_improve", "Improve", true, None::<&str>)?;
+    let ai_shorten_item = MenuItem::with_id(app, "ai_shorten", "Shorten", true, None::<&str>)?;
+    let ai_expand_item = MenuItem::with_id(app, "ai_expand", "Expand", true, None::<&str>)?;
+    let ai_simplify_item = MenuItem::with_id(app, "ai_simplify", "Simplify", true, None::<&str>)?;
+    let ai_fix_grammar_item =
+        MenuItem::with_id(app, "ai_fix_grammar", "Fix Grammar", true, None::<&str>)?;
     let ai_settings_item = MenuItem::with_id(app, "ai_settings", "Settings", true, None::<&str>)?;
+
+    let use_case_proposal_item =
+        MenuItem::with_id(app, "use_case_proposal", "Write Proposal", true, None::<&str>)?;
+    let use_case_task_plan_item =
+        MenuItem::with_id(app, "use_case_task_plan", "Create Task Plan", true, None::<&str>)?;
+    let use_case_email_item =
+        MenuItem::with_id(app, "use_case_email", "Write Email", true, None::<&str>)?;
 
     let file_menu = Submenu::with_items(
         app,
@@ -151,6 +166,7 @@ fn build_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
         true,
         &[
             &undo_item,
+            &undo_ai_item,
             &PredefinedMenuItem::separator(app)?,
             &cut_item,
             &copy_item,
@@ -166,11 +182,44 @@ fn build_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     let help_menu = Submenu::with_items(app, "Help", true, &[&about_item])?;
 
-    let ai_menu = Submenu::with_items(app, "AI", true, &[&ai_rewrite_item, &ai_settings_item])?;
+    let ai_menu = Submenu::with_items(
+        app,
+        "AI",
+        true,
+        &[
+            &ai_rewrite_item,
+            &ai_improve_item,
+            &ai_shorten_item,
+            &ai_expand_item,
+            &ai_simplify_item,
+            &ai_fix_grammar_item,
+            &PredefinedMenuItem::separator(app)?,
+            &ai_settings_item,
+        ],
+    )?;
+
+    let use_case_menu = Submenu::with_items(
+        app,
+        "Use Case",
+        true,
+        &[
+            &use_case_proposal_item,
+            &use_case_task_plan_item,
+            &use_case_email_item,
+        ],
+    )?;
 
     Menu::with_items(
         app,
-        &[&file_menu, &edit_menu, &format_menu, &view_menu, &help_menu, &ai_menu],
+        &[
+            &file_menu,
+            &edit_menu,
+            &format_menu,
+            &view_menu,
+            &help_menu,
+            &ai_menu,
+            &use_case_menu,
+        ],
     )
 }
 

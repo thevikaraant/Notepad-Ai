@@ -43,15 +43,51 @@ const aiClose = getRequiredElement<HTMLButtonElement>("#ai-close");
 const aiCancel = getRequiredElement<HTMLButtonElement>("#ai-cancel");
 const aiSave = getRequiredElement<HTMLButtonElement>("#ai-save");
 const aiClear = getRequiredElement<HTMLButtonElement>("#ai-clear");
+const aiContextMenu = getRequiredElement<HTMLDivElement>("#ai-context-menu");
 const busyOverlay = getRequiredElement<HTMLDivElement>("#busy-overlay");
+const aiResultBar = getRequiredElement<HTMLDivElement>("#ai-result-bar");
+const aiApply = getRequiredElement<HTMLButtonElement>("#ai-apply");
+const aiKeepBoth = getRequiredElement<HTMLButtonElement>("#ai-keep-both");
+const aiCopy = getRequiredElement<HTMLButtonElement>("#ai-copy");
+const aiCancelResult = getRequiredElement<HTMLButtonElement>("#ai-cancel-result");
 
 let currentFilePath: string | null = null;
 let isDirty = false;
 let wordWrapEnabled = true;
 let statusBarVisible = true;
 let hasStoredKey = false;
+let lastSelection: { start: number; end: number } | null = null;
+let lastSelectionText = "";
+let docVersion = 0;
+let suppressVersionBump = false;
+let lastAiSnapshot: { text: string } | null = null;
+let pendingAiResult: {
+  text: string;
+  beforeText: string;
+  beforeDirty: boolean;
+  selectionStart: number;
+  selectionEnd: number;
+  hadSelection: boolean;
+  requestVersion: number;
+} | null = null;
 
 const defaultPrompt = "Make this clearer and more concise while preserving meaning.";
+const quickActionPrompts: Record<string, string> = {
+  rewrite: defaultPrompt,
+  improve: "Improve clarity and flow while preserving meaning.",
+  shorten: "Shorten the text while keeping the key points.",
+  expand: "Expand the text with more detail while preserving meaning.",
+  simplify: "Simplify the text for easier understanding.",
+  "fix-grammar": "Fix grammar, spelling, and punctuation without changing meaning.",
+};
+const useCasePrompts: Record<string, string> = {
+  proposal: "Write a clear, concise proposal based on the text.",
+  "task-plan": "Create a task plan with steps, owners if known, and timeline.",
+  email: "Write a professional email based on the text.",
+};
+const aiContextButtons = Array.from(
+  aiContextMenu.querySelectorAll<HTMLButtonElement>("button[data-action]"),
+);
 
 function getFileName(path: string | null) {
   if (!path) return "Untitled";
@@ -80,6 +116,10 @@ function setWordWrap(next: boolean) {
   statusWrap.textContent = `Word Wrap: ${wordWrapEnabled ? "On" : "Off"}`;
 }
 
+function toggleWordWrap() {
+  setWordWrap(!wordWrapEnabled);
+}
+
 function setStatusBarVisible(next: boolean) {
   statusBarVisible = next;
   statusBar.classList.toggle("hidden", !statusBarVisible);
@@ -91,6 +131,22 @@ function updateCursorStatus() {
   const lineNumber = lines.length || 1;
   const columnNumber = (lines[lines.length - 1] || "").length + 1;
   statusPosition.textContent = `Ln ${lineNumber}, Col ${columnNumber}`;
+}
+
+function getQuickActionPrompt(action: string): string | null {
+  return quickActionPrompts[action] || null;
+}
+
+function runAiQuickAction(action: string) {
+  const promptOverride = getQuickActionPrompt(action);
+  if (!promptOverride) return;
+  void runAiRewrite(promptOverride);
+}
+
+function runAiUseCase(action: string) {
+  const promptOverride = useCasePrompts[action];
+  if (!promptOverride) return;
+  void runAiRewrite(promptOverride);
 }
 
 async function ensureStore(): Promise<Store> {
@@ -241,6 +297,9 @@ function setBusyState(active: boolean) {
   busyOverlay.classList.toggle("visible", active);
   busyOverlay.setAttribute("aria-hidden", active ? "false" : "true");
   editor.disabled = active;
+  for (const button of aiContextButtons) {
+    button.disabled = active;
+  }
 }
 
 function getSelectionText() {
@@ -250,10 +309,72 @@ function getSelectionText() {
   return "";
 }
 
+function closeAiContextMenu() {
+  aiContextMenu.classList.remove("open");
+  aiContextMenu.setAttribute("aria-hidden", "true");
+}
+
+function openAiContextMenu(x: number, y: number) {
+  aiContextMenu.classList.add("open");
+  aiContextMenu.setAttribute("aria-hidden", "false");
+  const padding = 8;
+  const rect = aiContextMenu.getBoundingClientRect();
+  const left = Math.min(
+    Math.max(padding, x),
+    window.innerWidth - rect.width - padding,
+  );
+  const top = Math.min(
+    Math.max(padding, y),
+    window.innerHeight - rect.height - padding,
+  );
+  aiContextMenu.style.left = `${left}px`;
+  aiContextMenu.style.top = `${top}px`;
+}
+
+function triggerQuickAction(action: string) {
+  const promptOverride = getQuickActionPrompt(action);
+  if (!promptOverride) return;
+  if (!lastSelectionText.trim()) return;
+  const selectionOverride = lastSelection
+    ? {
+        start: lastSelection.start,
+        end: lastSelection.end,
+        text: lastSelectionText,
+      }
+    : undefined;
+  closeAiContextMenu();
+  void runAiRewrite(promptOverride, selectionOverride);
+}
+
 function replaceSelection(text: string) {
   const start = editor.selectionStart || 0;
   const end = editor.selectionEnd || 0;
   editor.setRangeText(text, start, end, "select");
+}
+
+function replaceSelectionRange(text: string, start: number, end: number) {
+  editor.setRangeText(text, start, end, "select");
+}
+
+function applyPreviewText(text: string, selection: { start: number; end: number }) {
+  suppressVersionBump = true;
+  replaceSelectionRange(text, selection.start, selection.end);
+}
+
+function applyPreviewAll(text: string) {
+  suppressVersionBump = true;
+  replaceAll(text);
+}
+
+function showAiResultBar() {
+  aiResultBar.classList.add("open");
+  aiResultBar.setAttribute("aria-hidden", "false");
+}
+
+function hideAiResultBar() {
+  aiResultBar.classList.remove("open");
+  aiResultBar.setAttribute("aria-hidden", "true");
+  pendingAiResult = null;
 }
 
 function replaceAll(text: string) {
@@ -314,7 +435,16 @@ function getErrorMessage(error: unknown): string {
   return "Unknown error.";
 }
 
-async function runAiRewrite() {
+async function runAiRewrite(
+  promptOverride?: string,
+  selectionOverride?: { start: number; end: number; text: string },
+) {
+  if (pendingAiResult) {
+    suppressVersionBump = true;
+    replaceAll(pendingAiResult.beforeText);
+    setDirtyState(pendingAiResult.beforeDirty);
+    hideAiResultBar();
+  }
   const { endpoint, prompt } = await getAiSettings();
   const key = (await invoke<string | null>("get_api_key")) || "";
   if (!endpoint) {
@@ -327,8 +457,8 @@ async function runAiRewrite() {
 
   console.log("AI rewrite: endpoint", endpoint);
 
-  const selection = getSelectionText();
-  const input = selection || editor.value;
+  const selectionText = selectionOverride?.text || getSelectionText();
+  const input = selectionText || editor.value;
   if (!input.trim()) {
     await message("There is no text to rewrite.", {
       title: "NotepadAI",
@@ -336,7 +466,6 @@ async function runAiRewrite() {
     });
     return;
   }
-
   let endpointUrl: URL | null = null;
   try {
     endpointUrl = new URL(endpoint);
@@ -357,14 +486,15 @@ async function runAiRewrite() {
     headers.Authorization = `Bearer ${key}`;
   }
 
-  const combinedPrompt = prompt ? `${prompt}\n\n${input}` : input;
+  const selectedPrompt = (promptOverride || prompt || defaultPrompt).trim();
+  const combinedPrompt = selectedPrompt ? `${selectedPrompt}\n\n${input}` : input;
   const body = isOllama
     ? {
         model: endpointUrl.searchParams.get("model") || "",
         prompt: combinedPrompt,
         stream: false,
       }
-    : { text: input, prompt: prompt || defaultPrompt };
+    : { text: input, prompt: selectedPrompt };
 
   if (isOllama && !body.model) {
     await message(
@@ -407,12 +537,24 @@ async function runAiRewrite() {
       throw new Error("Empty response from AI service.");
     }
 
-    if (selection) {
-      replaceSelection(output);
+    const start = selectionOverride?.start ?? (editor.selectionStart || 0);
+    const end = selectionOverride?.end ?? (editor.selectionEnd || 0);
+    pendingAiResult = {
+      text: output,
+      beforeText: editor.value,
+      beforeDirty: isDirty,
+      selectionStart: start,
+      selectionEnd: end,
+      hadSelection: Boolean(selectionText),
+      requestVersion: docVersion,
+    };
+    if (pendingAiResult.hadSelection) {
+      applyPreviewText(output, { start, end });
     } else {
-      replaceAll(output);
+      applyPreviewAll(output);
     }
     setDirtyState(true);
+    showAiResultBar();
   } catch (error) {
     const messageText = getErrorMessage(error);
     await message(messageText, {
@@ -452,6 +594,12 @@ async function handleMenuEvent(id: string) {
     case "edit_undo":
       execEditorCommand("undo");
       break;
+    case "edit_undo_ai":
+      if (lastAiSnapshot) {
+        replaceAll(lastAiSnapshot.text);
+        setDirtyState(true);
+      }
+      break;
     case "edit_cut":
       execEditorCommand("cut");
       break;
@@ -465,7 +613,7 @@ async function handleMenuEvent(id: string) {
       editor.select();
       break;
     case "format_word_wrap":
-      setWordWrap(!wordWrapEnabled);
+      toggleWordWrap();
       break;
     case "view_status_bar":
       setStatusBarVisible(!statusBarVisible);
@@ -475,6 +623,30 @@ async function handleMenuEvent(id: string) {
       break;
     case "ai_rewrite":
       await runAiRewrite();
+      break;
+    case "ai_improve":
+      runAiQuickAction("improve");
+      break;
+    case "ai_shorten":
+      runAiQuickAction("shorten");
+      break;
+    case "ai_expand":
+      runAiQuickAction("expand");
+      break;
+    case "ai_simplify":
+      runAiQuickAction("simplify");
+      break;
+    case "ai_fix_grammar":
+      runAiQuickAction("fix-grammar");
+      break;
+    case "use_case_proposal":
+      runAiUseCase("proposal");
+      break;
+    case "use_case_task_plan":
+      runAiUseCase("task-plan");
+      break;
+    case "use_case_email":
+      runAiUseCase("email");
       break;
     case "ai_settings":
       openAiModal();
@@ -514,6 +686,11 @@ async function init() {
 
   editor.addEventListener("input", () => {
     if (!isDirty) setDirtyState(true);
+    if (suppressVersionBump) {
+      suppressVersionBump = false;
+    } else {
+      docVersion += 1;
+    }
     updateCursorStatus();
   });
   editor.addEventListener("click", updateCursorStatus);
@@ -523,6 +700,108 @@ async function init() {
   editor.addEventListener("focus", updateCursorStatus);
   document.addEventListener("selectionchange", () => {
     if (document.activeElement === editor) updateCursorStatus();
+  });
+  statusWrap.addEventListener("click", () => {
+    toggleWordWrap();
+  });
+  editor.addEventListener("contextmenu", (event) => {
+    if (editor.disabled) return;
+    const selection = getSelectionText();
+    if (!selection.trim()) {
+      closeAiContextMenu();
+      return;
+    }
+    event.preventDefault();
+    lastSelection = {
+      start: editor.selectionStart || 0,
+      end: editor.selectionEnd || 0,
+    };
+    lastSelectionText = selection;
+    editor.focus();
+    editor.selectionStart = lastSelection.start;
+    editor.selectionEnd = lastSelection.end;
+    openAiContextMenu(event.clientX, event.clientY);
+  });
+  editor.addEventListener("scroll", closeAiContextMenu);
+  editor.addEventListener("blur", closeAiContextMenu);
+  window.addEventListener("resize", closeAiContextMenu);
+  document.addEventListener("click", (event) => {
+    if (!aiContextMenu.classList.contains("open")) return;
+    if (aiContextMenu.contains(event.target as Node)) return;
+    closeAiContextMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeAiContextMenu();
+  });
+  aiContextMenu.addEventListener("pointerdown", (event) => {
+    const target = (event.target as HTMLElement).closest(
+      "button[data-action]",
+    ) as HTMLButtonElement | null;
+    if (!target) return;
+    event.preventDefault();
+    const action = target.dataset.action;
+    if (action) triggerQuickAction(action);
+  });
+
+  aiApply.addEventListener("click", () => {
+    if (!pendingAiResult) return;
+    if (pendingAiResult.requestVersion !== docVersion) {
+      const proceed = window.confirm("Document changed. Apply anyway?");
+      if (!proceed) return;
+    }
+    lastAiSnapshot = { text: pendingAiResult.beforeText };
+    setDirtyState(true);
+    hideAiResultBar();
+  });
+
+  aiKeepBoth.addEventListener("click", () => {
+    if (!pendingAiResult) return;
+    if (pendingAiResult.requestVersion !== docVersion) {
+      const proceed = window.confirm("Document changed. Apply anyway?");
+      if (!proceed) return;
+    }
+    lastAiSnapshot = { text: pendingAiResult.beforeText };
+    suppressVersionBump = true;
+    replaceAll(pendingAiResult.beforeText);
+    if (pendingAiResult.hadSelection) {
+      const insert = `\n${pendingAiResult.text}`;
+      replaceSelectionRange(
+        insert,
+        pendingAiResult.selectionEnd,
+        pendingAiResult.selectionEnd,
+      );
+    } else {
+      const spacer = editor.value.endsWith("\n") ? "" : "\n";
+      replaceAll(`${editor.value}${spacer}${pendingAiResult.text}`);
+    }
+    setDirtyState(true);
+    hideAiResultBar();
+  });
+
+  aiCopy.addEventListener("click", async () => {
+    if (!pendingAiResult) return;
+    try {
+      await navigator.clipboard.writeText(pendingAiResult.text);
+      suppressVersionBump = true;
+      replaceAll(pendingAiResult.beforeText);
+      setDirtyState(pendingAiResult.beforeDirty);
+      hideAiResultBar();
+    } catch (error) {
+      const messageText = getErrorMessage(error);
+      await message(messageText, {
+        title: "NotepadAI",
+        kind: "error",
+      });
+    }
+  });
+
+  aiCancelResult.addEventListener("click", () => {
+    if (pendingAiResult) {
+      suppressVersionBump = true;
+      replaceAll(pendingAiResult.beforeText);
+      setDirtyState(pendingAiResult.beforeDirty);
+    }
+    hideAiResultBar();
   });
 
   aiClose.addEventListener("click", closeAiModal);
