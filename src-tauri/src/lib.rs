@@ -1,20 +1,42 @@
+use futures_util::StreamExt;
 use keyring::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{Emitter, Manager, Runtime};
+use tauri::{Emitter, Manager, Runtime, State};
 
 use tauri_plugin_dialog::{
     DialogExt, MessageDialogBuilder, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
 
 const KEYRING_SERVICE: &str = "NotepadAI";
-const KEYRING_ACCOUNT: &str = "api_key";
+const LEGACY_KEYRING_ACCOUNT: &str = "api_key";
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+struct CancelFlags(Mutex<HashSet<String>>);
+
+fn keyring_account(provider: &str) -> String {
+    format!("key_{}", provider)
+}
+
+/// A fresh client per call (cheap: reqwest clients are just handles around a
+/// shared connector pool) with a bounded connect timeout, so an unreachable
+/// local server (wrong port, server not started) fails fast instead of
+/// hanging indefinitely. No overall request timeout is set — AI generations,
+/// especially on local hardware, can legitimately take a long time.
+fn build_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|err| err.to_string())
+}
 
 #[derive(serde::Deserialize)]
-struct AiRequest {
-    endpoint: String,
+struct HttpRequestInput {
+    method: String,
+    url: String,
     headers: HashMap<String, String>,
-    body: serde_json::Value,
+    body: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -24,15 +46,52 @@ struct AiResponse {
     body: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct StreamChunkEvent {
+    request_id: String,
+    data: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct StreamEndEvent {
+    request_id: String,
+    status: u16,
+    aborted: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct StreamErrorEvent {
+    request_id: String,
+    message: String,
+    status: Option<u16>,
+    body: Option<String>,
+}
+
+fn build_header_map(
+    headers: &HashMap<String, String>,
+) -> Result<reqwest::header::HeaderMap, String> {
+    let mut header_map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let header_value =
+            reqwest::header::HeaderValue::from_str(value).map_err(|err| err.to_string())?;
+        header_map.insert(header_name, header_value);
+    }
+    Ok(header_map)
+}
+
 #[tauri::command]
-fn set_api_key(key: String) -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|err| err.to_string())?;
+fn set_api_key(provider: String, key: String) -> Result<(), String> {
+    let entry =
+        Entry::new(KEYRING_SERVICE, &keyring_account(&provider)).map_err(|err| err.to_string())?;
     entry.set_password(&key).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn get_api_key() -> Result<Option<String>, String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|err| err.to_string())?;
+fn get_api_key(provider: String) -> Result<Option<String>, String> {
+    let entry =
+        Entry::new(KEYRING_SERVICE, &keyring_account(&provider)).map_err(|err| err.to_string())?;
     match entry.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -41,8 +100,9 @@ fn get_api_key() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn delete_api_key() -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|err| err.to_string())?;
+fn delete_api_key(provider: String) -> Result<(), String> {
+    let entry =
+        Entry::new(KEYRING_SERVICE, &keyring_account(&provider)).map_err(|err| err.to_string())?;
     match entry.delete_password() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
@@ -50,21 +110,54 @@ fn delete_api_key() -> Result<(), String> {
     }
 }
 
+/// One-time migration from the single legacy keyring secret (pre-multi-provider)
+/// to the new per-provider account. Returns true if a legacy secret was found
+/// and moved. Never overwrites an existing secret already stored for the target
+/// provider.
 #[tauri::command]
-async fn ai_request(request: AiRequest) -> Result<AiResponse, String> {
-    let mut header_map = reqwest::header::HeaderMap::new();
-    for (name, value) in request.headers {
-        let header_name =
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|err| err.to_string())?;
-        let header_value =
-            reqwest::header::HeaderValue::from_str(&value).map_err(|err| err.to_string())?;
-        header_map.insert(header_name, header_value);
+fn migrate_legacy_api_key(target_provider: String) -> Result<bool, String> {
+    let legacy = Entry::new(KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT).map_err(|err| err.to_string())?;
+    let legacy_value = match legacy.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(false),
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let target = Entry::new(KEYRING_SERVICE, &keyring_account(&target_provider))
+        .map_err(|err| err.to_string())?;
+    let already_has_target = matches!(target.get_password(), Ok(_));
+    if !already_has_target {
+        target
+            .set_password(&legacy_value)
+            .map_err(|err| err.to_string())?;
     }
 
-    let response = reqwest::Client::new()
-        .post(&request.endpoint)
+    match legacy.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn http_request(request: HttpRequestInput) -> Result<AiResponse, String> {
+    let header_map = build_header_map(&request.headers)?;
+    let client = build_client()?;
+    let builder = match request.method.to_uppercase().as_str() {
+        "GET" => client.get(&request.url),
+        "POST" => {
+            let mut builder = client.post(&request.url);
+            if let Some(body) = &request.body {
+                builder = builder.json(body);
+            }
+            builder
+        }
+        other => return Err(format!("Unsupported HTTP method: {}", other)),
+    };
+
+    let response = builder
         .headers(header_map)
-        .json(&request.body)
         .send()
         .await
         .map_err(|err| err.to_string())?;
@@ -83,6 +176,162 @@ async fn ai_request(request: AiRequest) -> Result<AiResponse, String> {
         headers,
         body,
     })
+}
+
+/// Streams a chat completion response back to the frontend as raw byte chunks
+/// via events, so the (provider-specific) SSE/NDJSON framing can be decoded in
+/// TypeScript. Emits exactly one of `ai-stream-error` (request never
+/// succeeded, or failed mid-stream) or a sequence of `ai-stream-chunk` events
+/// followed by `ai-stream-end`.
+#[tauri::command]
+async fn ai_stream_request<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    cancel_flags: State<'_, CancelFlags>,
+    request_id: String,
+    method: String,
+    url: String,
+    headers: HashMap<String, String>,
+    body: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let header_map = match build_header_map(&headers) {
+        Ok(map) => map,
+        Err(err) => {
+            let _ = app.emit(
+                "ai-stream-error",
+                StreamErrorEvent {
+                    request_id: request_id.clone(),
+                    message: err.clone(),
+                    status: None,
+                    body: None,
+                },
+            );
+            return Err(err);
+        }
+    };
+
+    let client = match build_client() {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = app.emit(
+                "ai-stream-error",
+                StreamErrorEvent {
+                    request_id: request_id.clone(),
+                    message: err.clone(),
+                    status: None,
+                    body: None,
+                },
+            );
+            return Err(err);
+        }
+    };
+    let builder = match method.to_uppercase().as_str() {
+        "GET" => client.get(&url),
+        "POST" => {
+            let mut builder = client.post(&url);
+            if let Some(body) = &body {
+                builder = builder.json(body);
+            }
+            builder
+        }
+        other => {
+            let message = format!("Unsupported HTTP method: {}", other);
+            let _ = app.emit(
+                "ai-stream-error",
+                StreamErrorEvent {
+                    request_id: request_id.clone(),
+                    message: message.clone(),
+                    status: None,
+                    body: None,
+                },
+            );
+            return Err(message);
+        }
+    };
+
+    let response = match builder.headers(header_map).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            let message = err.to_string();
+            let _ = app.emit(
+                "ai-stream-error",
+                StreamErrorEvent {
+                    request_id: request_id.clone(),
+                    message: message.clone(),
+                    status: None,
+                    body: None,
+                },
+            );
+            return Err(message);
+        }
+    };
+
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let _ = app.emit(
+            "ai-stream-error",
+            StreamErrorEvent {
+                request_id: request_id.clone(),
+                message: format!("Request failed with status {}", status),
+                status: Some(status),
+                body: Some(body_text),
+            },
+        );
+        cancel_flags.0.lock().unwrap().remove(&request_id);
+        return Ok(());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut aborted = false;
+    loop {
+        if cancel_flags.0.lock().unwrap().remove(&request_id) {
+            aborted = true;
+            break;
+        }
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let _ = app.emit(
+                    "ai-stream-chunk",
+                    StreamChunkEvent {
+                        request_id: request_id.clone(),
+                        data: text,
+                    },
+                );
+            }
+            Some(Err(err)) => {
+                let _ = app.emit(
+                    "ai-stream-error",
+                    StreamErrorEvent {
+                        request_id: request_id.clone(),
+                        message: err.to_string(),
+                        status: None,
+                        body: None,
+                    },
+                );
+                cancel_flags.0.lock().unwrap().remove(&request_id);
+                return Ok(());
+            }
+            None => break,
+        }
+    }
+
+    let _ = app.emit(
+        "ai-stream-end",
+        StreamEndEvent {
+            request_id: request_id.clone(),
+            status,
+            aborted,
+        },
+    );
+    cancel_flags.0.lock().unwrap().remove(&request_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_ai_stream(cancel_flags: State<'_, CancelFlags>, request_id: String) -> Result<(), String> {
+    cancel_flags.0.lock().unwrap().insert(request_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -229,6 +478,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .manage(CancelFlags(Mutex::new(HashSet::new())))
         .setup(|app| {
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
@@ -252,7 +502,10 @@ pub fn run() {
             set_api_key,
             get_api_key,
             delete_api_key,
-            ai_request,
+            migrate_legacy_api_key,
+            http_request,
+            ai_stream_request,
+            cancel_ai_stream,
             confirm_unsaved_changes
         ])
         .run(tauri::generate_context!())
