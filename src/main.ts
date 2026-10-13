@@ -5,21 +5,31 @@ import { message, open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { Store } from "@tauri-apps/plugin-store";
 
+import { describeHttpError } from "./providers/errors";
+import { cleanAiResponseText } from "./responseFormatter";
+import { sendHttpRequest, startStream, type StreamHandle } from "./providers/httpClient";
+import { PROVIDER_ORDER, getProviderDefinition, resolveEffectiveConfig } from "./providers/registry";
+import type { ProviderConfig, ProviderId } from "./providers/types";
+import {
+  DEFAULT_PROMPT,
+  deleteProviderApiKey,
+  defaultSettings,
+  getProviderApiKey,
+  hostOf,
+  loadSettings,
+  migrateLegacyApiKey,
+  needsHostTrustWarning,
+  saveSettings,
+  setProviderApiKey,
+  type AppSettings,
+  type CustomUseCase,
+} from "./settings";
+
 type UnsavedChoice = "save" | "dont_save" | "cancel";
-
-type AiSettings = {
-  endpoint: string;
-  prompt: string;
-};
-
-type AiHttpResponse = {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-};
 
 const appWindow = getCurrentWindow();
 let settingsStore: Store | null = null;
+let appSettings: AppSettings = defaultSettings();
 
 function getRequiredElement<T extends HTMLElement>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -35,16 +45,41 @@ const statusPosition =
   getRequiredElement<HTMLSpanElement>("#status-position");
 const statusWrap = getRequiredElement<HTMLSpanElement>("#status-wrap");
 const aiModal = getRequiredElement<HTMLDivElement>("#ai-modal");
-const aiEndpoint = getRequiredElement<HTMLInputElement>("#ai-endpoint");
+const aiProviderSelect = getRequiredElement<HTMLSelectElement>("#ai-provider");
+const aiBaseUrl = getRequiredElement<HTMLInputElement>("#ai-base-url");
+const aiBaseUrlHint = getRequiredElement<HTMLSpanElement>("#ai-base-url-hint");
+const aiModelInput = getRequiredElement<HTMLInputElement>("#ai-model");
+const aiModelList = getRequiredElement<HTMLDataListElement>("#ai-model-list");
+const aiFetchModels = getRequiredElement<HTMLButtonElement>("#ai-fetch-models");
+const aiModelStatus = getRequiredElement<HTMLSpanElement>("#ai-model-status");
+const aiOrgProjectFields = getRequiredElement<HTMLDivElement>("#ai-org-project");
+const aiOrganization = getRequiredElement<HTMLInputElement>("#ai-organization");
+const aiProject = getRequiredElement<HTMLInputElement>("#ai-project");
 const aiKey = getRequiredElement<HTMLInputElement>("#ai-key");
 const aiKeyStatus = getRequiredElement<HTMLSpanElement>("#ai-key-status");
+const aiTrustWarning = getRequiredElement<HTMLDivElement>("#ai-trust-warning");
+const aiTrustWarningText = getRequiredElement<HTMLSpanElement>("#ai-trust-warning-text");
+const aiTrustAccept = getRequiredElement<HTMLButtonElement>("#ai-trust-accept");
+const aiTestConnection = getRequiredElement<HTMLButtonElement>("#ai-test-connection");
+const aiTestStatus = getRequiredElement<HTMLSpanElement>("#ai-test-status");
 const aiPrompt = getRequiredElement<HTMLTextAreaElement>("#ai-prompt");
 const aiClose = getRequiredElement<HTMLButtonElement>("#ai-close");
 const aiCancel = getRequiredElement<HTMLButtonElement>("#ai-cancel");
 const aiSave = getRequiredElement<HTMLButtonElement>("#ai-save");
 const aiClear = getRequiredElement<HTMLButtonElement>("#ai-clear");
 const aiContextMenu = getRequiredElement<HTMLDivElement>("#ai-context-menu");
+const aiCustomInstructionForm = getRequiredElement<HTMLFormElement>("#ai-custom-instruction-form");
+const aiCustomInstructionInput = getRequiredElement<HTMLInputElement>("#ai-custom-instruction");
+const aiContextMenuCustom = getRequiredElement<HTMLDivElement>("#ai-context-menu-custom");
+const aiUseCaseList = getRequiredElement<HTMLDivElement>("#ai-use-case-list");
+const aiUseCaseLabelInput = getRequiredElement<HTMLInputElement>("#ai-use-case-label");
+const aiUseCasePromptInput = getRequiredElement<HTMLInputElement>("#ai-use-case-prompt");
+const aiUseCaseAdd = getRequiredElement<HTMLButtonElement>("#ai-use-case-add");
 const busyOverlay = getRequiredElement<HTMLDivElement>("#busy-overlay");
+const busyOverlayText = getRequiredElement<HTMLDivElement>("#busy-overlay-text");
+const aiStreamStatus = getRequiredElement<HTMLDivElement>("#ai-stream-status");
+const aiStreamStatusText = getRequiredElement<HTMLSpanElement>("#ai-stream-status-text");
+const aiStreamStop = getRequiredElement<HTMLButtonElement>("#ai-stream-stop");
 const aiResultBar = getRequiredElement<HTMLDivElement>("#ai-result-bar");
 const aiApply = getRequiredElement<HTMLButtonElement>("#ai-apply");
 const aiKeepBoth = getRequiredElement<HTMLButtonElement>("#ai-keep-both");
@@ -55,12 +90,13 @@ let currentFilePath: string | null = null;
 let isDirty = false;
 let wordWrapEnabled = true;
 let statusBarVisible = true;
-let hasStoredKey = false;
 let lastSelection: { start: number; end: number } | null = null;
 let lastSelectionText = "";
 let docVersion = 0;
 let suppressVersionBump = false;
 let lastAiSnapshot: { text: string } | null = null;
+let activeStreamHandle: StreamHandle | null = null;
+let pendingTrustAction: (() => Promise<void>) | null = null;
 let pendingAiResult: {
   text: string;
   beforeText: string;
@@ -71,9 +107,8 @@ let pendingAiResult: {
   requestVersion: number;
 } | null = null;
 
-const defaultPrompt = "Make this clearer and more concise while preserving meaning.";
 const quickActionPrompts: Record<string, string> = {
-  rewrite: defaultPrompt,
+  rewrite: DEFAULT_PROMPT,
   improve: "Improve clarity and flow while preserving meaning.",
   shorten: "Shorten the text while keeping the key points.",
   expand: "Expand the text with more detail while preserving meaning.",
@@ -155,58 +190,322 @@ async function ensureStore(): Promise<Store> {
   return settingsStore;
 }
 
-async function getAiSettings(): Promise<AiSettings> {
+async function ensureAppSettingsLoaded(): Promise<AppSettings> {
   const store = await ensureStore();
-  const endpoint = ((await store.get("apiEndpoint")) as string) || "";
-  const prompt = ((await store.get("customPrompt")) as string) || "";
-  return { endpoint, prompt };
+  appSettings = await loadSettings({ store, migrateLegacyApiKey });
+  return appSettings;
+}
+
+async function persistAppSettings(): Promise<void> {
+  const store = await ensureStore();
+  await saveSettings(store, appSettings);
+}
+
+/** Renders the right-click menu's list of user-defined use cases (below the built-in quick actions). */
+function renderCustomUseCaseContextButtons() {
+  aiContextMenuCustom.innerHTML = "";
+  if (appSettings.customUseCases.length === 0) return;
+  const separator = document.createElement("div");
+  separator.className = "ai-context-menu-separator";
+  aiContextMenuCustom.appendChild(separator);
+  for (const useCase of appSettings.customUseCases) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.role = "menuitem";
+    button.dataset.customUseCaseId = useCase.id;
+    button.textContent = useCase.label;
+    aiContextMenuCustom.appendChild(button);
+  }
+}
+
+/** Renders the manage-list in AI Settings (label + Remove button per custom use case). */
+function renderUseCaseManagerList() {
+  aiUseCaseList.innerHTML = "";
+  for (const useCase of appSettings.customUseCases) {
+    const row = document.createElement("div");
+    row.className = "use-case-row";
+    const label = document.createElement("span");
+    label.className = "use-case-label";
+    label.textContent = useCase.label;
+    label.title = useCase.prompt;
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "ghost";
+    removeButton.textContent = "Remove";
+    removeButton.dataset.id = useCase.id;
+    row.appendChild(label);
+    row.appendChild(removeButton);
+    aiUseCaseList.appendChild(row);
+  }
+}
+
+async function addCustomUseCase() {
+  const label = aiUseCaseLabelInput.value.trim();
+  const prompt = aiUseCasePromptInput.value.trim();
+  if (!label || !prompt) return;
+  const useCase: CustomUseCase = { id: crypto.randomUUID(), label, prompt };
+  appSettings.customUseCases = [...appSettings.customUseCases, useCase];
+  aiUseCaseLabelInput.value = "";
+  aiUseCasePromptInput.value = "";
+  await persistAppSettings();
+  renderUseCaseManagerList();
+  renderCustomUseCaseContextButtons();
+}
+
+async function removeCustomUseCase(id: string) {
+  appSettings.customUseCases = appSettings.customUseCases.filter((useCase) => useCase.id !== id);
+  await persistAppSettings();
+  renderUseCaseManagerList();
+  renderCustomUseCaseContextButtons();
+}
+
+function populateProviderSelect() {
+  aiProviderSelect.innerHTML = "";
+  const localGroup = document.createElement("optgroup");
+  localGroup.label = "Local / Self-hosted";
+  const cloudGroup = document.createElement("optgroup");
+  cloudGroup.label = "Cloud";
+  for (const id of PROVIDER_ORDER) {
+    const def = getProviderDefinition(id);
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = def.label;
+    (def.category === "local" ? localGroup : cloudGroup).appendChild(option);
+  }
+  aiProviderSelect.appendChild(localGroup);
+  aiProviderSelect.appendChild(cloudGroup);
+}
+
+function hideTrustWarning() {
+  aiTrustWarning.hidden = true;
+  pendingTrustAction = null;
+}
+
+function showTrustWarning(host: string, onAccept: () => Promise<void>) {
+  aiTrustWarningText.textContent = `You're about to send your API key to "${host}". Only continue if you trust this endpoint.`;
+  aiTrustWarning.hidden = false;
+  pendingTrustAction = onAccept;
+}
+
+async function onProviderSelectionChanged() {
+  const providerId = aiProviderSelect.value as ProviderId;
+  const def = getProviderDefinition(providerId);
+  const config = appSettings.providers[providerId] || { model: "" };
+
+  aiBaseUrl.value = config.baseUrl || def.defaultBaseUrl || "";
+  aiBaseUrl.readOnly = !def.baseUrlEditable;
+  aiBaseUrl.placeholder = def.defaultBaseUrl || "https://...";
+  aiBaseUrlHint.textContent = def.baseUrlEditable
+    ? "Point this at your server's address."
+    : "Fixed by the provider.";
+
+  aiModelInput.value = config.model || "";
+  aiModelInput.placeholder = def.modelPlaceholder;
+  aiModelList.innerHTML = "";
+  aiModelStatus.textContent = "";
+  aiFetchModels.disabled = !def.adapter.supportsModelList;
+  aiFetchModels.title = def.adapter.supportsModelList
+    ? ""
+    : "This provider has no official model-list endpoint.";
+
+  aiOrgProjectFields.hidden = !def.supportsOrgProject;
+  aiOrganization.value = config.organization || "";
+  aiProject.value = config.project || "";
+
+  aiKey.value = "";
+  let storedKey: string | null = null;
+  try {
+    storedKey = await getProviderApiKey(providerId);
+  } catch {
+    storedKey = null;
+  }
+  aiKeyStatus.textContent = storedKey
+    ? "API key stored securely."
+    : def.requiresApiKey
+      ? "No key stored (required)."
+      : "No key stored.";
+
+  hideTrustWarning();
+  aiTestStatus.textContent = "";
 }
 
 async function loadAiSettings() {
-  console.log("AI settings: load");
-  const { endpoint, prompt } = await getAiSettings();
-  aiEndpoint.value = endpoint;
-  aiPrompt.value = prompt || defaultPrompt;
+  aiProviderSelect.value = appSettings.activeProviderId;
+  await onProviderSelectionChanged();
+  aiPrompt.value = appSettings.customPrompt || DEFAULT_PROMPT;
+  renderUseCaseManagerList();
+}
 
-  let storedKey = "";
-  try {
-    storedKey = (await invoke<string | null>("get_api_key")) || "";
-  } catch {
-    storedKey = "";
-  }
-  hasStoredKey = storedKey.length > 0;
-  aiKeyStatus.textContent = hasStoredKey
-    ? "API key stored securely."
-    : "No key stored.";
-  aiKey.value = "";
+function readDraftConfig(def: ReturnType<typeof getProviderDefinition>): ProviderConfig {
+  return {
+    model: aiModelInput.value.trim(),
+    baseUrl: def.baseUrlEditable ? aiBaseUrl.value.trim() || undefined : undefined,
+    organization: def.supportsOrgProject ? aiOrganization.value.trim() || undefined : undefined,
+    project: def.supportsOrgProject ? aiProject.value.trim() || undefined : undefined,
+  };
 }
 
 async function saveAiSettings() {
-  const store = await ensureStore();
-  await store.set("apiEndpoint", aiEndpoint.value.trim());
-  await store.set("customPrompt", aiPrompt.value.trim());
-  await store.save();
+  const providerId = aiProviderSelect.value as ProviderId;
+  const def = getProviderDefinition(providerId);
+  const draftConfig = readDraftConfig(def);
 
-  const key = aiKey.value.trim();
-  if (key) {
-    await invoke("set_api_key", { key });
-    hasStoredKey = true;
+  const keyInput = aiKey.value.trim();
+  const willHaveKey = Boolean(keyInput) || Boolean(await getProviderApiKey(providerId));
+
+  if (def.baseUrlEditable) {
+    const effective = resolveEffectiveConfig(providerId, draftConfig);
+    if (effective.baseUrl && needsHostTrustWarning(effective.baseUrl, willHaveKey, appSettings.trustedHosts)) {
+      const host = hostOf(effective.baseUrl);
+      if (host) {
+        showTrustWarning(host, async () => {
+          appSettings.trustedHosts = [...appSettings.trustedHosts, host];
+          await saveAiSettings();
+        });
+        return;
+      }
+    }
   }
 
-  aiKeyStatus.textContent = hasStoredKey
-    ? "API key stored securely."
-    : "No key stored.";
+  appSettings.providers[providerId] = draftConfig;
+  appSettings.activeProviderId = providerId;
+  appSettings.customPrompt = aiPrompt.value.trim();
+
+  await persistAppSettings();
+
+  if (keyInput) {
+    await setProviderApiKey(providerId, keyInput);
+  }
+
+  closeAiModal();
 }
 
 async function clearAiKey() {
-  await invoke("delete_api_key");
-  hasStoredKey = false;
-  aiKeyStatus.textContent = "No key stored.";
+  const providerId = aiProviderSelect.value as ProviderId;
+  await deleteProviderApiKey(providerId);
   aiKey.value = "";
+  const def = getProviderDefinition(providerId);
+  aiKeyStatus.textContent = def.requiresApiKey ? "No key stored (required)." : "No key stored.";
+}
+
+async function runTestConnection() {
+  const providerId = aiProviderSelect.value as ProviderId;
+  const def = getProviderDefinition(providerId);
+  const draftConfig = readDraftConfig(def);
+  const effective = resolveEffectiveConfig(providerId, draftConfig);
+
+  if (!effective.baseUrl) {
+    aiTestStatus.textContent = "Set a base URL first.";
+    return;
+  }
+
+  const keyInput = aiKey.value.trim();
+  const apiKey = keyInput || (await getProviderApiKey(providerId));
+  if (def.requiresApiKey && !apiKey) {
+    aiTestStatus.textContent = "Add an API key first.";
+    return;
+  }
+
+  if (def.baseUrlEditable && needsHostTrustWarning(effective.baseUrl, Boolean(apiKey), appSettings.trustedHosts)) {
+    const host = hostOf(effective.baseUrl);
+    if (host) {
+      showTrustWarning(host, async () => {
+        appSettings.trustedHosts = [...appSettings.trustedHosts, host];
+        await runTestConnection();
+      });
+      return;
+    }
+  }
+
+  aiTestStatus.textContent = "";
+  aiTestConnection.disabled = true;
+  setBusyState(true, "Testing connection…");
+  try {
+    if (def.adapter.supportsModelList) {
+      const request = def.adapter.buildModelListRequest!(effective, apiKey);
+      const result = await sendHttpRequest(request);
+      if (result.status < 200 || result.status >= 300) {
+        throw new Error(describeHttpError(result.status, result.body));
+      }
+      const models = def.adapter.parseModelListResponse!(result.body);
+      aiTestStatus.textContent = `Connected. ${models.length} model${models.length === 1 ? "" : "s"} available.`;
+    } else {
+      if (!effective.model.trim()) {
+        aiTestStatus.textContent = "Enter a model id first.";
+        return;
+      }
+      const request = def.adapter.buildChatRequest(effective, apiKey, "Reply with OK.", false);
+      const result = await sendHttpRequest(request);
+      def.adapter.parseNonStreamResponse(result.status, result.body);
+      aiTestStatus.textContent = "Connected. (This provider has no model-list endpoint, so this was a minimal real request.)";
+    }
+  } catch (error) {
+    aiTestStatus.textContent = getErrorMessage(error);
+  } finally {
+    setBusyState(false);
+    aiTestConnection.disabled = false;
+  }
+}
+
+async function runFetchModels() {
+  const providerId = aiProviderSelect.value as ProviderId;
+  const def = getProviderDefinition(providerId);
+  if (!def.adapter.supportsModelList) {
+    aiModelStatus.textContent = "This provider has no model-list endpoint. Enter the model id manually.";
+    return;
+  }
+
+  const draftConfig = readDraftConfig(def);
+  const effective = resolveEffectiveConfig(providerId, draftConfig);
+  if (!effective.baseUrl) {
+    aiModelStatus.textContent = "Set a base URL first.";
+    return;
+  }
+
+  const keyInput = aiKey.value.trim();
+  const apiKey = keyInput || (await getProviderApiKey(providerId));
+  if (def.requiresApiKey && !apiKey) {
+    aiModelStatus.textContent = "Add an API key first.";
+    return;
+  }
+
+  if (def.baseUrlEditable && needsHostTrustWarning(effective.baseUrl, Boolean(apiKey), appSettings.trustedHosts)) {
+    const host = hostOf(effective.baseUrl);
+    if (host) {
+      showTrustWarning(host, async () => {
+        appSettings.trustedHosts = [...appSettings.trustedHosts, host];
+        await runFetchModels();
+      });
+      return;
+    }
+  }
+
+  aiModelStatus.textContent = "";
+  aiFetchModels.disabled = true;
+  setBusyState(true, "Fetching models…");
+  try {
+    const request = def.adapter.buildModelListRequest!(effective, apiKey);
+    const result = await sendHttpRequest(request);
+    if (result.status < 200 || result.status >= 300) {
+      throw new Error(describeHttpError(result.status, result.body));
+    }
+    const models = def.adapter.parseModelListResponse!(result.body);
+    aiModelList.innerHTML = "";
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      aiModelList.appendChild(option);
+    }
+    aiModelStatus.textContent = models.length ? `Found ${models.length} models.` : "No models returned.";
+  } catch (error) {
+    aiModelStatus.textContent = getErrorMessage(error);
+  } finally {
+    setBusyState(false);
+    aiFetchModels.disabled = !def.adapter.supportsModelList;
+  }
 }
 
 function openAiModal() {
-  console.log("AI settings: open modal");
   aiModal.classList.add("open");
   aiModal.setAttribute("aria-hidden", "false");
 }
@@ -246,7 +545,6 @@ async function openFile() {
     multiple: false,
     title: "Open File",
   });
-  console.log("open dialog selection:", selected);
   if (!selected || Array.isArray(selected)) return;
   const contents = await readTextFile(selected);
   editor.value = contents;
@@ -262,12 +560,10 @@ async function saveFile(saveAs = false): Promise<boolean> {
       title: "Save File",
       defaultPath: targetPath || undefined,
     });
-    console.log("save dialog selection:", selected);
     if (!selected) return false;
     targetPath = selected;
   }
   try {
-    console.log("writing file:", targetPath);
     await writeTextFile(targetPath, editor.value);
     currentFilePath = targetPath;
     setDirtyState(false);
@@ -293,13 +589,20 @@ function execEditorCommand(command: string) {
   document.execCommand(command);
 }
 
-function setBusyState(active: boolean) {
+function setBusyState(active: boolean, text = "Working…") {
+  busyOverlayText.textContent = text;
   busyOverlay.classList.toggle("visible", active);
   busyOverlay.setAttribute("aria-hidden", active ? "false" : "true");
+}
+
+function setGeneratingState(active: boolean) {
   editor.disabled = active;
   for (const button of aiContextButtons) {
     button.disabled = active;
   }
+  aiStreamStatusText.textContent = "Generating…";
+  aiStreamStatus.classList.toggle("open", active);
+  aiStreamStatus.setAttribute("aria-hidden", active ? "false" : "true");
 }
 
 function getSelectionText() {
@@ -331,9 +634,7 @@ function openAiContextMenu(x: number, y: number) {
   aiContextMenu.style.top = `${top}px`;
 }
 
-function triggerQuickAction(action: string) {
-  const promptOverride = getQuickActionPrompt(action);
-  if (!promptOverride) return;
+function runOnLastSelection(promptOverride: string) {
   if (!lastSelectionText.trim()) return;
   const selectionOverride = lastSelection
     ? {
@@ -346,10 +647,14 @@ function triggerQuickAction(action: string) {
   void runAiRewrite(promptOverride, selectionOverride);
 }
 
-function replaceSelection(text: string) {
-  const start = editor.selectionStart || 0;
-  const end = editor.selectionEnd || 0;
-  editor.setRangeText(text, start, end, "select");
+function triggerQuickAction(action: string) {
+  const promptOverride = getQuickActionPrompt(action);
+  if (!promptOverride) return;
+  runOnLastSelection(promptOverride);
+}
+
+function triggerCustomInstruction(instruction: string) {
+  runOnLastSelection(instruction);
 }
 
 function replaceSelectionRange(text: string, start: number, end: number) {
@@ -383,46 +688,6 @@ function replaceAll(text: string) {
   editor.selectionEnd = editor.value.length;
 }
 
-function extractAiText(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return "";
-  const data = payload as Record<string, unknown>;
-  if (typeof data.text === "string") return data.text;
-  if (typeof data.output === "string") return data.output;
-  if (typeof data.result === "string") return data.result;
-  if (typeof data.response === "string") return data.response;
-  const choices = data.choices as unknown[] | undefined;
-  if (choices && choices.length > 0) {
-    const first = choices[0] as Record<string, unknown>;
-    const message = first.message as Record<string, unknown> | undefined;
-    if (message && typeof message.content === "string") return message.content;
-    if (typeof first.text === "string") return first.text;
-  }
-  return "";
-}
-
-async function parseAiResponse(response: Response): Promise<string> {
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    const parsed = (await response.json()) as unknown;
-    return extractAiText(parsed);
-  }
-
-  const raw = await response.text();
-  const lines = raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length === 0) return "";
-
-  const lastLine = lines[lines.length - 1];
-  try {
-    const parsed = JSON.parse(lastLine) as unknown;
-    return extractAiText(parsed);
-  } catch {
-    return raw.trim();
-  }
-}
-
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -439,23 +704,43 @@ async function runAiRewrite(
   promptOverride?: string,
   selectionOverride?: { start: number; end: number; text: string },
 ) {
+  if (activeStreamHandle) return;
+
   if (pendingAiResult) {
     suppressVersionBump = true;
     replaceAll(pendingAiResult.beforeText);
     setDirtyState(pendingAiResult.beforeDirty);
     hideAiResultBar();
   }
-  const { endpoint, prompt } = await getAiSettings();
-  const key = (await invoke<string | null>("get_api_key")) || "";
-  if (!endpoint) {
-    await message("Set your API endpoint in AI Settings first.", {
+
+  const providerId = appSettings.activeProviderId;
+  const def = getProviderDefinition(providerId);
+  const storedConfig = appSettings.providers[providerId] || { model: "" };
+  const effectiveConfig = resolveEffectiveConfig(providerId, storedConfig);
+
+  if (!effectiveConfig.baseUrl) {
+    await message(`Set a base URL for ${def.label} in AI Settings first.`, {
+      title: "NotepadAI",
+      kind: "warning",
+    });
+    return;
+  }
+  if (!effectiveConfig.model.trim()) {
+    await message(`Set a model for ${def.label} in AI Settings first.`, {
       title: "NotepadAI",
       kind: "warning",
     });
     return;
   }
 
-  console.log("AI rewrite: endpoint", endpoint);
+  const apiKey = await getProviderApiKey(providerId);
+  if (def.requiresApiKey && !apiKey) {
+    await message(`${def.label} requires an API key. Add it in AI Settings first.`, {
+      title: "NotepadAI",
+      kind: "warning",
+    });
+    return;
+  }
 
   const selectionText = selectionOverride?.text || getSelectionText();
   const input = selectionText || editor.value;
@@ -466,104 +751,109 @@ async function runAiRewrite(
     });
     return;
   }
-  let endpointUrl: URL | null = null;
-  try {
-    endpointUrl = new URL(endpoint);
-  } catch {
-    await message("Invalid API endpoint URL.", {
-      title: "NotepadAI",
-      kind: "error",
-    });
-    return;
-  }
 
-  const isOllama = endpointUrl.pathname.endsWith("/api/generate");
-  console.log("AI rewrite: isOllama", isOllama);
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (key) {
-    headers.Authorization = `Bearer ${key}`;
-  }
-
-  const selectedPrompt = (promptOverride || prompt || defaultPrompt).trim();
+  const selectedPrompt = (promptOverride || appSettings.customPrompt || DEFAULT_PROMPT).trim();
   const combinedPrompt = selectedPrompt ? `${selectedPrompt}\n\n${input}` : input;
-  const body = isOllama
-    ? {
-        model: endpointUrl.searchParams.get("model") || "",
-        prompt: combinedPrompt,
-        stream: false,
-      }
-    : { text: input, prompt: selectedPrompt };
 
-  if (isOllama && !body.model) {
-    await message(
-      "Ollama requires a model name. Add ?model=llama3 (or your model) to the endpoint.",
-      {
-        title: "NotepadAI",
-        kind: "warning",
-      },
-    );
+  let spec;
+  try {
+    spec = def.adapter.buildChatRequest(effectiveConfig, apiKey, combinedPrompt, true);
+  } catch (error) {
+    await message(getErrorMessage(error), { title: "NotepadAI", kind: "error" });
     return;
   }
 
-  console.log("AI rewrite: request body", body);
-  setBusyState(true);
-  try {
-    const responseData = await invoke<AiHttpResponse>("ai_request", {
-      request: {
-        endpoint,
-        headers,
-        body,
-      },
-    });
-    const response = new Response(responseData.body, {
-      status: responseData.status,
-      headers: responseData.headers,
-    });
+  const start = selectionOverride?.start ?? (editor.selectionStart || 0);
+  const end = selectionOverride?.end ?? (editor.selectionEnd || 0);
+  const hadSelection = Boolean(selectionText);
+  const beforeText = editor.value;
+  const beforeDirty = isDirty;
+  const requestVersion = docVersion;
 
-    console.log("AI rewrite: response status", response.status);
-    if (response.status === 401) {
-      throw new Error("Unauthorized (401). Check your API key.");
-    }
+  let accumulated = "";
+  let curEnd = end;
+  let gotAnyDelta = false;
 
-    if (!response.ok) {
-      throw new Error(`Network error (${response.status}).`);
-    }
+  setGeneratingState(true);
+  const decoder = def.adapter.createStreamDecoder();
 
-    const output = await parseAiResponse(response);
-    console.log("AI rewrite: output length", output.length);
-    if (!output.trim()) {
-      throw new Error("Empty response from AI service.");
-    }
-
-    const start = selectionOverride?.start ?? (editor.selectionStart || 0);
-    const end = selectionOverride?.end ?? (editor.selectionEnd || 0);
-    pendingAiResult = {
-      text: output,
-      beforeText: editor.value,
-      beforeDirty: isDirty,
-      selectionStart: start,
-      selectionEnd: end,
-      hadSelection: Boolean(selectionText),
-      requestVersion: docVersion,
-    };
-    if (pendingAiResult.hadSelection) {
-      applyPreviewText(output, { start, end });
-    } else {
-      applyPreviewAll(output);
-    }
-    setDirtyState(true);
-    showAiResultBar();
-  } catch (error) {
-    const messageText = getErrorMessage(error);
-    await message(messageText, {
-      title: "NotepadAI",
-      kind: "error",
-    });
-  } finally {
-    setBusyState(false);
-  }
+  activeStreamHandle = await startStream(spec, decoder, {
+    onDelta: (text) => {
+      accumulated += text;
+      gotAnyDelta = true;
+      if (hadSelection) {
+        applyPreviewText(accumulated, { start, end: curEnd });
+        curEnd = start + accumulated.length;
+      } else {
+        applyPreviewAll(accumulated);
+      }
+    },
+    onDone: (aborted) => {
+      setGeneratingState(false);
+      activeStreamHandle = null;
+      if (!gotAnyDelta) {
+        suppressVersionBump = true;
+        replaceAll(beforeText);
+        setDirtyState(beforeDirty);
+        if (!aborted) {
+          void message("Empty response from the AI service.", {
+            title: "NotepadAI",
+            kind: "error",
+          });
+        }
+        return;
+      }
+      const cleaned = cleanAiResponseText(accumulated);
+      if (hadSelection) {
+        applyPreviewText(cleaned, { start, end: curEnd });
+      } else {
+        applyPreviewAll(cleaned);
+      }
+      pendingAiResult = {
+        text: cleaned,
+        beforeText,
+        beforeDirty,
+        selectionStart: start,
+        selectionEnd: end,
+        hadSelection,
+        requestVersion,
+      };
+      setDirtyState(true);
+      showAiResultBar();
+    },
+    onError: (errorMessage) => {
+      setGeneratingState(false);
+      activeStreamHandle = null;
+      if (gotAnyDelta) {
+        const cleaned = cleanAiResponseText(accumulated);
+        if (hadSelection) {
+          applyPreviewText(cleaned, { start, end: curEnd });
+        } else {
+          applyPreviewAll(cleaned);
+        }
+        pendingAiResult = {
+          text: cleaned,
+          beforeText,
+          beforeDirty,
+          selectionStart: start,
+          selectionEnd: end,
+          hadSelection,
+          requestVersion,
+        };
+        setDirtyState(true);
+        showAiResultBar();
+        void message(
+          `Streaming was interrupted: ${errorMessage}\n\nShowing the partial result below — Apply, Keep Both, Copy, or Cancel.`,
+          { title: "NotepadAI", kind: "warning" },
+        );
+      } else {
+        suppressVersionBump = true;
+        replaceAll(beforeText);
+        setDirtyState(beforeDirty);
+        void message(errorMessage, { title: "NotepadAI", kind: "error" });
+      }
+    },
+  });
 }
 
 function showAbout() {
@@ -574,7 +864,6 @@ function showAbout() {
 }
 
 async function handleMenuEvent(id: string) {
-  console.log("handleMenuEvent:", id);
   switch (id) {
     case "file_new":
       await newFile();
@@ -674,11 +963,15 @@ async function init() {
     console.error("unhandled rejection:", event.reason);
   });
 
+  populateProviderSelect();
+
   try {
-    await ensureStore();
+    await ensureAppSettingsLoaded();
   } catch (error) {
-    console.error("settings store init failed:", error);
+    console.error("settings load failed:", error);
   }
+  renderCustomUseCaseContextButtons();
+
   updateWindowTitle();
   updateCursorStatus();
   setWordWrap(true);
@@ -720,10 +1013,17 @@ async function init() {
     editor.focus();
     editor.selectionStart = lastSelection.start;
     editor.selectionEnd = lastSelection.end;
+    aiCustomInstructionInput.value = "";
+    renderCustomUseCaseContextButtons();
     openAiContextMenu(event.clientX, event.clientY);
+    aiCustomInstructionInput.focus();
   });
   editor.addEventListener("scroll", closeAiContextMenu);
-  editor.addEventListener("blur", closeAiContextMenu);
+  editor.addEventListener("blur", (event) => {
+    const next = event.relatedTarget as Node | null;
+    if (next && aiContextMenu.contains(next)) return;
+    closeAiContextMenu();
+  });
   window.addEventListener("resize", closeAiContextMenu);
   document.addEventListener("click", (event) => {
     if (!aiContextMenu.classList.contains("open")) return;
@@ -734,13 +1034,39 @@ async function init() {
     if (event.key === "Escape") closeAiContextMenu();
   });
   aiContextMenu.addEventListener("pointerdown", (event) => {
-    const target = (event.target as HTMLElement).closest(
-      "button[data-action]",
-    ) as HTMLButtonElement | null;
-    if (!target) return;
+    const element = event.target as HTMLElement;
+    const actionTarget = element.closest("button[data-action]") as HTMLButtonElement | null;
+    if (actionTarget) {
+      event.preventDefault();
+      const action = actionTarget.dataset.action;
+      if (action) triggerQuickAction(action);
+      return;
+    }
+    const customTarget = element.closest("button[data-custom-use-case-id]") as HTMLButtonElement | null;
+    if (customTarget) {
+      event.preventDefault();
+      const useCaseId = customTarget.dataset.customUseCaseId;
+      const useCase = appSettings.customUseCases.find((item) => item.id === useCaseId);
+      if (useCase) triggerCustomInstruction(useCase.prompt);
+    }
+  });
+
+  aiCustomInstructionForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    const action = target.dataset.action;
-    if (action) triggerQuickAction(action);
+    const instruction = aiCustomInstructionInput.value.trim();
+    if (!instruction) return;
+    aiCustomInstructionInput.value = "";
+    triggerCustomInstruction(instruction);
+  });
+
+  aiUseCaseAdd.addEventListener("click", () => {
+    void addCustomUseCase();
+  });
+
+  aiUseCaseList.addEventListener("click", (event) => {
+    const target = (event.target as HTMLElement).closest("button[data-id]") as HTMLButtonElement | null;
+    if (!target?.dataset.id) return;
+    void removeCustomUseCase(target.dataset.id);
   });
 
   aiApply.addEventListener("click", () => {
@@ -804,6 +1130,28 @@ async function init() {
     hideAiResultBar();
   });
 
+  aiStreamStop.addEventListener("click", () => {
+    activeStreamHandle?.cancel();
+  });
+
+  aiProviderSelect.addEventListener("change", () => {
+    void onProviderSelectionChanged();
+  });
+
+  aiFetchModels.addEventListener("click", () => {
+    void runFetchModels();
+  });
+
+  aiTestConnection.addEventListener("click", () => {
+    void runTestConnection();
+  });
+
+  aiTrustAccept.addEventListener("click", async () => {
+    const action = pendingTrustAction;
+    hideTrustWarning();
+    if (action) await action();
+  });
+
   aiClose.addEventListener("click", closeAiModal);
   aiCancel.addEventListener("click", closeAiModal);
   aiClear.addEventListener("click", async () => {
@@ -811,7 +1159,6 @@ async function init() {
   });
   aiSave.addEventListener("click", async () => {
     await saveAiSettings();
-    closeAiModal();
   });
 
   aiModal.addEventListener("click", (event) => {
@@ -820,7 +1167,6 @@ async function init() {
   });
 
   await listen<string>("menu-event", (event) => {
-    console.log("app event menu-event:", event.payload);
     void handleMenuEvent(event.payload);
   });
 }

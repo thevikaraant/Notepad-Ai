@@ -26,6 +26,18 @@
       role="menu"
       aria-hidden="true"
     >
+      <form id="ai-custom-instruction-form" class="custom-instruction-form">
+        <input
+          id="ai-custom-instruction"
+          type="text"
+          placeholder="Custom instruction…"
+          autocomplete="off"
+        />
+        <button id="ai-custom-instruction-submit" type="submit" class="primary">
+          Go
+        </button>
+      </form>
+      <div class="ai-context-menu-separator"></div>
       <button type="button" data-action="rewrite" role="menuitem">
         Rewrite
       </button>
@@ -44,6 +56,7 @@
       <button type="button" data-action="fix-grammar" role="menuitem">
         Fix Grammar
       </button>
+      <div id="ai-context-menu-custom" class="ai-context-menu-custom"></div>
     </div>
 
     <div id="ai-modal" class="modal" aria-hidden="true">
@@ -55,18 +68,60 @@
         </header>
         <div class="modal-body">
           <label>
-            API Endpoint
-            <input id="ai-endpoint" type="text" placeholder="https://example.com/rewrite" />
+            Provider
+            <select id="ai-provider"></select>
           </label>
+          <label>
+            Base URL
+            <input id="ai-base-url" type="text" placeholder="http://localhost:11434" />
+            <span id="ai-base-url-hint" class="hint"></span>
+          </label>
+          <label>
+            Model
+            <div class="model-row">
+              <input id="ai-model" type="text" list="ai-model-list" placeholder="enter a model id" />
+              <button id="ai-fetch-models" class="ghost" type="button">Fetch Models</button>
+            </div>
+            <datalist id="ai-model-list"></datalist>
+            <span id="ai-model-status" class="hint"></span>
+          </label>
+          <div id="ai-org-project" class="org-project-fields" hidden>
+            <label>
+              Organization (optional)
+              <input id="ai-organization" type="text" placeholder="org-..." />
+            </label>
+            <label>
+              Project (optional)
+              <input id="ai-project" type="text" placeholder="proj_..." />
+            </label>
+          </div>
           <label>
             API Key
             <input id="ai-key" type="password" placeholder="Paste your key" />
             <span id="ai-key-status" class="hint">No key stored.</span>
           </label>
+          <div id="ai-trust-warning" class="trust-warning" hidden>
+            <span id="ai-trust-warning-text"></span>
+            <button id="ai-trust-accept" class="ghost" type="button">Trust This Host &amp; Save</button>
+          </div>
+          <div class="test-connection-row">
+            <button id="ai-test-connection" class="ghost" type="button">Test Connection</button>
+            <span id="ai-test-status" class="hint"></span>
+          </div>
           <label>
             Custom Prompt
             <textarea id="ai-prompt" rows="5" placeholder="Make this clearer and more concise."></textarea>
           </label>
+          <div class="use-case-manager">
+            <span class="section-label">Custom Use Cases</span>
+            <span class="hint">Appears in the right-click menu alongside Rewrite/Improve/etc.</span>
+            <div id="ai-use-case-list" class="use-case-list"></div>
+            <div class="use-case-add-row">
+              <input id="ai-use-case-label" type="text" placeholder="Label (e.g. Slack Message)" />
+              <input id="ai-use-case-prompt" type="text" placeholder="Prompt (e.g. Rewrite as a casual Slack message.)" />
+              <button id="ai-use-case-add" class="ghost" type="button">Add</button>
+            </div>
+          </div>
         </div>
         <footer>
           <button id="ai-clear" class="ghost">Clear Key</button>
@@ -78,7 +133,12 @@
     </div>
 
     <div id="busy-overlay" class="busy" aria-hidden="true">
-      <div class="busy-card">Rewriting…</div>
+      <div id="busy-overlay-text" class="busy-card">Working…</div>
+    </div>
+
+    <div id="ai-stream-status" class="ai-stream-status" aria-hidden="true">
+      <span id="ai-stream-status-text">Generating…</span>
+      <button id="ai-stream-stop" class="ghost" type="button">Stop</button>
     </div>
 
     <div id="ai-result-bar" class="ai-result-bar" aria-hidden="true">
